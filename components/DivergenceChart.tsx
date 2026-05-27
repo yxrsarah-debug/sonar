@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 
-type Pt = { date: string; price: number | null; real: boolean; social: number | null; poly: number | null; socialSample?: boolean };
+type Pt = { date: string; price: number | null; real: boolean; social: number | null; poly: number | null; socialSample?: boolean; polySample?: boolean };
 
 const C = { social: "#2DD4BF", poly: "#F8B84E", price: "#A78BFA", grid: "#22304d", axis: "#7E8AA8" };
 
@@ -70,6 +70,7 @@ export default function DivergenceChart({ ticker, refreshKey = 0 }: { ticker?: s
   const socialSeg = seg((p) => (p.social === null ? null : y100(p.social)));
   const polySeg = seg((p) => (p.poly === null ? null : y100(p.poly)));
   const hasSample = pts.some((p) => p.socialSample);
+  const hasPolySample = pts.some((p) => p.polySample);
 
   const dot = (sel: (p: Pt) => number | null, color: string) =>
     pts.map((p, i) => { const v = sel(p); return v === null ? null : <circle key={`${color}${i}`} cx={x(i)} cy={v} r={3} fill={color} />; });
@@ -88,6 +89,7 @@ export default function DivergenceChart({ ticker, refreshKey = 0 }: { ticker?: s
           No series yet for {ticker}. The price line needs a live fetch; social &amp; Polymarket fill in as snapshots accumulate.
         </p>
       ) : (
+        <>
         <svg viewBox={`0 0 ${W} ${H}`} width="100%" role="img" aria-label={`5-day divergence chart for ${ticker}`}>
           {[0, 20, 40, 60, 80, 100].map((v) => (
             <g key={v}>
@@ -108,12 +110,27 @@ export default function DivergenceChart({ ticker, refreshKey = 0 }: { ticker?: s
 
           {solid && <polyline points={solid} fill="none" stroke={C.price} strokeWidth={2.5} />}
           {dottedSeg && <polyline points={dottedSeg} fill="none" stroke={C.price} strokeWidth={2.5} strokeDasharray="5 5" />}
-          {polySeg && <polyline points={polySeg} fill="none" stroke={C.poly} strokeWidth={2.5} />}
+          {polySeg && (
+            <polyline points={polySeg} fill="none" stroke={C.poly} strokeWidth={2.5} strokeDasharray={hasPolySample ? "4 4" : undefined} />
+          )}
           {socialSeg && (
             <polyline points={socialSeg} fill="none" stroke={C.social} strokeWidth={2.5} strokeDasharray={hasSample ? "4 4" : undefined} />
           )}
           {dot((p) => (p.price === null ? null : priceY(p.price)), C.price)}
-          {dot((p) => (p.poly === null ? null : y100(p.poly)), C.poly)}
+          {/* poly markers: filled = real, hollow = sample */}
+          {pts.map((p, i) =>
+            p.poly === null ? null : (
+              <circle
+                key={`p${i}`}
+                cx={x(i)}
+                cy={y100(p.poly)}
+                r={3.2}
+                fill={p.polySample ? "#0A0F1E" : C.poly}
+                stroke={C.poly}
+                strokeWidth={p.polySample ? 1.5 : 0}
+              />
+            ),
+          )}
           {/* social markers: filled = real, hollow = sample */}
           {pts.map((p, i) =>
             p.social === null ? null : (
@@ -133,11 +150,28 @@ export default function DivergenceChart({ ticker, refreshKey = 0 }: { ticker?: s
             <rect x={padL} y={8} width={12} height={3} fill={C.social} />
             <text x={padL + 18} y={12}>Social volume</text>
             <rect x={padL + 130} y={8} width={12} height={3} fill={C.poly} />
-            <text x={padL + 148} y={12}>Polymarket odds</text>
+            <text x={padL + 148} y={12}>Polymarket odds{hasPolySample ? " (sample)" : ""}</text>
             <rect x={padL + 285} y={8} width={12} height={3} fill={C.price} />
             <text x={padL + 303} y={12}>Price{hasCarried ? " (last close)" : ""}</text>
           </g>
         </svg>
+        <div style={{ marginTop: 10, fontSize: 11.5, color: "#8C99B3", lineHeight: 1.65 }}>
+          <div>
+            <span style={{ color: "#2DD4BF", fontWeight: 700 }}>Social ▲</span> chatter heating up&nbsp;·&nbsp;
+            <span style={{ color: "#2DD4BF", fontWeight: 700 }}>▼</span> cooling off
+          </div>
+          <div>
+            <span style={{ color: "#F8B84E", fontWeight: 700 }}>Polymarket ▲</span> crowd more convinced&nbsp;·&nbsp;
+            <span style={{ color: "#F8B84E", fontWeight: 700 }}>▼</span> conviction fading
+          </div>
+          <div>
+            <span style={{ color: "#A78BFA", fontWeight: 700 }}>Price ▲▼</span> the actual move&nbsp;·&nbsp;flat dotted = last close (weekend)
+          </div>
+          <div style={{ marginTop: 6, color: "#EAF0FB" }}>
+            <b>Divergence:</b> social &amp; odds climbing while price stays flat — that gap is the “look here, now.”
+          </div>
+        </div>
+        </>
       )}
     </div>
   );

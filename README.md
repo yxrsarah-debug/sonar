@@ -102,6 +102,28 @@ Because all watchlist names are always-busy mega-caps, flagging is **relative**:
 
 ---
 
+## Under the hood: how Sonar uses Nimble & ClickHouse
+
+### Nimble — the SENSE layer (real, multi-source web data)
+
+Sonar calls Nimble's **Search API / Web Search Agents** (`POST https://sdk.nimbleway.com/v1/search`, Bearer auth, `search_depth: "lite"`) with **focus modes** that route to specialized agents:
+
+- **News** — `focus: "news"`, query `"<TICKER> stock news"` → real, current headlines (title, source domain, link). The news *count* and the *headline tone* both feed the divergence score.
+- **Social** — `focus: "social"`, query `"<TICKER> stock"` → results from across **X/Twitter, Reddit, Stocktwits, YouTube, Threads** and the wider web. Sonar buckets every result **by platform** (from its hostname) and counts them — so "social volume" is a real, **multi-platform** chatter measure, not a single feed. You can see the per-platform split in `social_events.platform`.
+
+To stay fast and within rate limits, Sonar **round-robins** the (slower) social agent — one ticker does a live social pull per loop pass — and **caches** news/social for 3 minutes. News is de-duplicated by URL; social uses the latest reading per platform. Everything degrades to clearly-labeled samples if the key is absent.
+
+### ClickHouse — the THINK layer (time-series engine)
+
+Every observation lands as a **timestamped row** in one of six MergeTree tables — `news_events`, `social_events`, `poly_events`, `price_events`, `briefs`, `reads` — ordered by `(ticker, ts)` for fast range scans.
+
+- **Windowed divergence:** `recentForTicker` pulls the last N minutes per stream per ticker; the score sums social volume, counts news, takes the lead Polymarket probability, and attenuates by price flatness.
+- **Daily aggregation (5-day chart):** `dailyForTicker` runs a **nested aggregation** — per-minute snapshot totals averaged per day — so the chart shows a clean daily trend that's robust to repeated snapshots.
+
+ClickHouse is the engine, not a logging sink: the radar, the divergence flag, and the chart are all ClickHouse queries.
+
+---
+
 ## Project structure
 
 ```

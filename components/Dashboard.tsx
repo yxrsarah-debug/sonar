@@ -4,6 +4,14 @@ import { useCallback, useEffect, useState } from "react";
 import type { Signal, Brief, Earnings, LoopResult } from "@/lib/types";
 import DivergenceChart from "@/components/DivergenceChart";
 
+type Stage = "idle" | "active" | "done";
+const STAGES = [
+  { key: "SENSE", tool: "Nimble + Custom", color: "#38BDF8" },
+  { key: "THINK", tool: "ClickHouse + Lexicon", color: "#2DD4BF" },
+  { key: "COMPOSE", tool: "Sonar", color: "#A78BFA" },
+  { key: "TRANSACT", tool: "x402 · CDP/AgentKit", color: "#F8B84E" },
+];
+
 type SignalsResponse = {
   signals: Signal[];
   earnings: Earnings;
@@ -22,6 +30,7 @@ export default function Dashboard() {
   const [paying, setPaying] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [chartKey, setChartKey] = useState(0);
+  const [stage, setStage] = useState<Stage[]>(["idle", "idle", "idle", "idle"]);
 
   const addLog = useCallback((text: string, cls?: string) => {
     const stamp = new Date().toLocaleTimeString();
@@ -50,19 +59,29 @@ export default function Dashboard() {
 
   const runLoop = useCallback(async () => {
     setScanning(true);
-    addLog("Running radar loop: sense → think → publish …");
+    setStage(["active", "idle", "idle", "idle"]);
+    addLog("Running radar loop: SENSE → THINK → COMPOSE …");
+    const t1 = setTimeout(() => setStage(["done", "active", "idle", "idle"]), 1300);
+    const t2 = setTimeout(() => setStage(["done", "done", "active", "idle"]), 2800);
     try {
       const res = await fetch("/api/loop", { method: "POST" });
       const data = (await res.json()) as LoopResult & { error?: string };
+      clearTimeout(t1);
+      clearTimeout(t2);
       if (data.error) {
         addLog(`loop error: ${data.error}`, "warn");
+        setStage(["idle", "idle", "idle", "idle"]);
       } else {
         for (const n of data.notes) addLog(n, "ok");
         if (data.publishedTicker) addLog(`★ Brief ready for ${data.publishedTicker}`, "ok");
+        setStage((s) => ["done", "done", "done", s[3]]);
       }
       await refresh();
     } catch (e) {
+      clearTimeout(t1);
+      clearTimeout(t2);
       addLog(`loop failed: ${String(e)}`, "warn");
+      setStage(["idle", "idle", "idle", "idle"]);
     } finally {
       setScanning(false);
     }
@@ -75,6 +94,7 @@ export default function Dashboard() {
       return;
     }
     setPaying(true);
+    setStage(["done", "done", "done", "active"]);
     try {
       addLog(`Buyer agent requesting ${target.ticker} feed (x402)…`);
       const res = await fetch(`/api/buy/${target.ticker}`, { method: "POST" });
@@ -86,12 +106,15 @@ export default function Dashboard() {
         } else {
           addLog(`✓ Agent read ${target.ticker} (demo-settle — set X402_PAY_TO + EVM_PRIVATE_KEY for real USDC)`, "ok");
         }
+        setStage(["done", "done", "done", "done"]);
         await refresh();
       } else {
         addLog(`payment failed: ${data.error ?? res.status}`, "warn");
+        setStage(["done", "done", "done", "idle"]);
       }
     } catch (e) {
       addLog(`payment sim failed: ${String(e)}`, "warn");
+      setStage(["done", "done", "done", "idle"]);
     } finally {
       setPaying(false);
     }
@@ -104,10 +127,18 @@ export default function Dashboard() {
   return (
     <div className="wrap">
       <div className="topbar">
-        <div className="brand">
-          <div className="eyebrow">Autonomous market intelligence · {storeKind ? `store: ${storeKind}` : ""}</div>
-          <h1>SONAR</h1>
-          <div className="sub">Market Intelligence Radar</div>
+        <div className="brand" style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/sonar-icon.png"
+            alt="Sonar logo"
+            style={{ height: 58, width: "auto", borderRadius: 12, background: "#fff", padding: 7, boxShadow: "0 2px 12px rgba(0,0,0,0.35)" }}
+          />
+          <div>
+            <div className="eyebrow">Autonomous market intelligence · {storeKind ? `store: ${storeKind}` : ""}</div>
+            <h1 style={{ margin: 0 }}>SONAR</h1>
+            <div className="sub">Market Intelligence Radar</div>
+          </div>
         </div>
         <div>
           <div className="statusrow">
@@ -125,8 +156,9 @@ export default function Dashboard() {
       </div>
 
       <div className="banner">
-        <b>Decision-support, not advice.</b> Sonar surfaces where to look and cites every source — it never issues buy/sell
-        signals or price predictions. On weekends, news / social / Polymarket are live; price is shown as “last close.”
+        <b>Decision-support, not advice.</b> A high <b>divergence score</b> means news + social chatter (and Polymarket
+        crowd-odds) are climbing while the price hasn’t moved yet — Sonar’s “look here, now,” with every source cited,
+        not a buy/sell call. On weekends, news / social / Polymarket are live; price is shown as “last close.”
       </div>
 
       <div className="controls">
@@ -140,6 +172,44 @@ export default function Dashboard() {
           Refresh
         </button>
       </div>
+
+      <div className="loopstrip">
+        <div className="loopstrip-label">THE AUTONOMOUS LOOP — one click runs it end to end</div>
+        <div className="pipeline" aria-label="agent pipeline">
+          {STAGES.map((st, i) => (
+            <div key={st.key} className="stagewrap">
+              <div className={`stage s-${stage[i]}`} style={stage[i] === "active" ? { borderColor: st.color } : undefined}>
+                <span className="st-num" style={{ background: stage[i] === "idle" ? "#2A3656" : st.color }}>
+                  {stage[i] === "done" ? "✓" : i + 1}
+                </span>
+                <span className="st-key">{st.key}</span>
+                <span className="st-tool">{st.tool}</span>
+              </div>
+              {i < STAGES.length - 1 && <span className="st-arrow">→</span>}
+            </div>
+          ))}
+          <span className="st-loop" title="continuous loop">↻</span>
+        </div>
+      </div>
+      <style>{`
+        .loopstrip { margin:16px 0 8px; border:1px solid #1B2540; background:#0E1526; border-radius:14px; padding:16px 18px; }
+        .loopstrip-label { font-size:11px; letter-spacing:2px; color:#2DD4BF; font-weight:700; margin-bottom:12px; }
+        .pipeline { display:flex; align-items:center; flex-wrap:wrap; gap:6px 0; }
+        .stagewrap { display:flex; align-items:center; }
+        .stage { border:1.5px solid #243049; background:#141C30; border-radius:12px; padding:13px 18px; min-width:162px; opacity:.5; transition:opacity .25s, border-color .25s; }
+        .stage.s-active { opacity:1; animation:pipePulse 1.1s ease-in-out infinite; }
+        .stage.s-done { opacity:1; }
+        .st-num { display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; border-radius:50%; font-size:12px; font-weight:800; color:#0A0F1E; margin-bottom:9px; }
+        .st-key { display:block; font-weight:800; font-size:17px; letter-spacing:1px; color:#EAF0FB; }
+        .st-tool { display:block; font-size:11.5px; color:#8C99B3; margin-top:3px; }
+        .st-arrow { color:#3A496B; margin:0 10px; font-size:22px; }
+        .st-loop { color:#2DD4BF; margin-left:12px; font-size:24px; align-self:center; }
+        @keyframes pipePulse { 0%,100%{ box-shadow:0 0 0 0 rgba(45,212,191,0);} 50%{ box-shadow:0 0 0 4px rgba(45,212,191,.40);} }
+        .formula { margin-top:12px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13.5px; background:#0E1526; border:1px solid #1B2540; border-radius:10px; padding:10px 12px; line-height:1.5; }
+        .formula .f-eq { color:#EAF0FB; font-weight:700; }
+        .formula .f-op { color:#6B7896; }
+        .formula-note { margin-top:7px; font-size:11.5px; color:#8C99B3; }
+      `}</style>
 
       <div className="grid">
         <div className="card">
@@ -213,6 +283,21 @@ export default function Dashboard() {
               price {top.lastPrice !== null ? `$${top.lastPrice.toFixed(2)} ` : ""}({top.priceChangePct}%).
             </p>
           )}
+
+          <div className="formula" aria-label="divergence formula">
+            <span className="f-eq">divergence</span>
+            <span className="f-op"> ≈ ( </span>
+            <span style={{ color: "#2DD4BF", fontWeight: 700 }}>0.5·social</span>
+            <span className="f-op"> + </span>
+            <span style={{ color: "#38BDF8", fontWeight: 700 }}>0.3·news</span>
+            <span className="f-op"> + </span>
+            <span style={{ color: "#F8B84E", fontWeight: 700 }}>0.2·poly</span>
+            <span className="f-op"> ) × </span>
+            <span style={{ color: "#A78BFA", fontWeight: 700 }}>price-flatness</span>
+          </div>
+          <div className="formula-note">
+            High when chatter, news &amp; crowd-odds are elevated but price is flat. Flatness → 1 when price hasn’t moved, → 0.5 once it has already run.
+          </div>
         </div>
 
         <div className="card brief">

@@ -1,96 +1,204 @@
 // SENSE layer — Polymarket adapter (the underused crowd-forecast signal).
-// Polymarket's Gamma API is public (no key), so this path is fully real.
-// Docs: https://docs.polymarket.com  (gamma-api.polymarket.com)
+// Gamma + CLOB are public (no key), so this path is fully real.
+// Docs: https://docs.polymarket.com/market-data/fetching-markets
 //
-// Polymarket rarely runs single-stock markets, so we match THEMATICALLY: the
-// company/people behind a ticker first (Nvidia, Musk, OpenAI…), then tech
-// themes (AI, chips), then macro markets that move all equities (Fed, rate
-// cuts, recession, Bitcoin). We pick the highest-volume real match per ticker.
+// Polymarket runs single-stock markets, but in two shapes:
+//   1. A clean binary forecast ("Will Meta ...?") — mid-range Yes odds.
+//   2. A THRESHOLD LADDER ("Will NVIDIA (NVDA) hit $232 / $236 / $240 ...?") —
+//      each rung is P(price >= strike). Individually they look pinned at 0/1,
+//      but together they ARE a real implied-confidence curve over the price.
+// We search per ticker (Gamma public-search) and pick that stock's most
+// informative LIVE market: a mid-range binary if one exists, otherwise the
+// "at-the-money" rung of the ladder (the strike nearest the current price),
+// whose odds carry the most signal. Only if neither exists do we fall back to a
+// clearly-labeled sample — never a shared macro number for all six.
 
 import type { PolyPoint } from "@/lib/types";
+import { stockPrice } from "@/lib/sources/prices";
 
 const GAMMA = "https://gamma-api.polymarket.com";
 
-// Cache the markets list so all watchlist tickers reuse one fetch per loop.
-const MARKETS_TTL = 3 * 60 * 1000;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let marketsCache: { data: any[]; at: number } | null = null;
+// Search query per ticker (company name matches the market titles).
+const SEARCH_Q: Record<string, string> = {
+  NVDA: "NVIDIA",
+  TSLA: "Tesla",
+  AAPL: "Apple",
+  MSFT: "Microsoft",
+  AMD: "AMD",
+  META: "Meta",
+};
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function getMarkets(): Promise<any[]> {
-  if (marketsCache && Date.now() - marketsCache.at < MARKETS_TTL) return marketsCache.data;
-  const url = `${GAMMA}/markets?closed=false&active=true&limit=500&order=volume24hr&ascending=false`;
+type Choice = { market: any; prob: number; kind: "live" | "ladder" };
+
+// Cache the chosen market per ticker so prob + history reuse one search.
+const marketCache = new Map<string, { choice: Choice | null; at: number }>();
+const MARKET_TTL = 5 * 60 * 1000;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function searchMarkets(q: string): Promise<any[]> {
+  const url = `${GAMMA}/public-search?q=${encodeURIComponent(q)}&limit_per_type=20`;
   const res = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(6000) });
-  if (!res.ok) throw new Error(`gamma ${res.status}`);
+  if (!res.ok) throw new Error(`gamma search ${res.status}`);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const markets = (await res.json()) as any[];
-  marketsCache = { data: markets, at: Date.now() };
-  return markets;
+  const data: any = await res.json();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const out: any[] = [];
+  const events = Array.isArray(data?.events) ? data.events : [];
+  for (const ev of events) {
+    const evText = `${ev?.title ?? ""} ${ev?.slug ?? ""}`;
+    const evSlug = ev?.slug ?? "";
+    const mks = Array.isArray(ev?.markets) ? ev.markets : [];
+    for (const mk of mks) out.push({ ...mk, _evText: evText, _evSlug: evSlug });
+  }
+  if (Array.isArray(data?.markets)) for (const mk of data.markets) out.push({ ...mk, _evText: "", _evSlug: "" });
+  return out;
 }
 
-// Matched in tiers, most specific first: company/people -> AI/tech -> macro.
-const COMPANY: Record<string, string[]> = {
-  NVDA: ["nvidia", "jensen huang"],
-  TSLA: ["tesla", "musk", "elon", "robotaxi", "spacex"],
-  AAPL: ["apple", "iphone", "tim cook", "vision pro"],
-  MSFT: ["microsoft", "copilot"],
-  AMD: ["amd"],
-  META: ["meta", "zuckerberg", "facebook", "instagram"],
-};
-const TECH = ["openai", "agi", "artificial intelligence", "ai", "gpu", "chip", "semiconductor"];
-const MACRO = ["fed", "interest rate", "rate cut", "recession", "bitcoin", "nasdaq", "stock market", "s&p"];
+// Pick the most informative live market for a ticker (cached).
+async function chooseStockMarket(ticker: string): Promise<Choice | null> {
+  const cached = marketCache.get(ticker);
+  if (cached && Date.now() - cached.at < MARKET_TTL) return cached.choice;
 
-// A market is a live "forecast" only if the crowd is still uncertain — exclude
-// effectively-resolved markets (lead outcome >= 93%), which carry no signal.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function isLiveForecast(m: any): boolean {
-  const p = leadProbability(m);
-  return p > 0 && p <= 0.93;
+  const q = SEARCH_Q[ticker] ?? ticker;
+  let choice: Choice | null = null;
+  try {
+    const markets = await searchMarkets(q);
+    const tl = ticker.toLowerCase();
+    const ql = q.toLowerCase();
+    const stockCands = markets.filter((mk) => {
+      const text = `${mk.question ?? ""} ${mk.slug ?? ""} ${mk._evText ?? ""}`.toLowerCase();
+      return text.includes(tl) || text.includes(ql);
+    });
+
+    // Tier 1 — a live, mid-range binary forecast (clean Yes/No market).
+    const live = stockCands
+      .filter((mk) => isOpen(mk) && clobTokenId(mk))
+      .map((mk) => ({ mk, p: yesProbability(mk) }))
+      .filter(({ p }) => p > 0.05 && p < 0.95)
+      .sort((a, b) => vol(b.mk) - vol(a.mk));
+
+    if (live.length) {
+      choice = { market: live[0].mk, prob: live[0].p, kind: "live" };
+    } else {
+      // Tier 2 — threshold ladder. Each rung is P(price >= strike); read it as a
+      // real implied-confidence reading by taking the AT-THE-MONEY rung (strike
+      // nearest the current price), whose odds are the most informative. Prefer
+      // open rungs; fall back to the full ladder so we still surface a real
+      // trajectory even after a weekly market has resolved.
+      const ladder = stockCands
+        .map((mk) => ({ mk, strike: parseStrike(`${mk.question ?? ""} ${mk._evText ?? ""}`), p: yesProbability(mk) }))
+        .filter((x): x is { mk: typeof x.mk; strike: number; p: number } => x.strike != null && !!clobTokenId(x.mk));
+      const openLadder = ladder.filter((x) => isOpen(x.mk));
+      const use = openLadder.length ? openLadder : ladder;
+      if (use.length) {
+        let price: number | null = null;
+        try {
+          price = (await stockPrice(ticker))[1]?.price ?? null;
+        } catch {
+          /* price optional — fall back to most-traded rung */
+        }
+        const pick =
+          price != null
+            ? use.reduce((best, x) => (Math.abs(x.strike - price!) < Math.abs(best.strike - price!) ? x : best), use[0])
+            : use.reduce((best, x) => (vol(x.mk) > vol(best.mk) ? x : best), use[0]);
+        choice = { market: pick.mk, prob: pick.p, kind: "ladder" };
+      }
+    }
+  } catch (e) {
+    console.error("[polymarket:search]", e);
+  }
+  marketCache.set(ticker, { choice, at: Date.now() });
+  return choice;
 }
 
 export async function polymarketFor(ticker: string): Promise<PolyPoint[]> {
+  const c = await chooseStockMarket(ticker);
+  if (c) {
+    const m = c.market;
+    return [
+      {
+        ticker,
+        ts: Date.now(),
+        marketId: String(m.id ?? m.conditionId ?? m.slug ?? ""),
+        question: m.question ?? m._evText ?? "",
+        prob: c.prob,
+        url: m._evSlug ? `https://polymarket.com/event/${m._evSlug}` : m.slug ? `https://polymarket.com/market/${m.slug}` : "https://polymarket.com",
+      },
+    ];
+  }
+  return fallbackPoly(ticker);
+}
+
+// Real 5-day daily odds history for the matched market (CLOB /prices-history).
+export async function polymarketHistory(ticker: string, days = 5): Promise<{ date: string; prob: number; question: string }[]> {
   try {
-    const markets = await getMarkets();
-    const now = Date.now();
-
-    const tiers = [COMPANY[ticker] ?? [ticker.toLowerCase()], TECH, MACRO];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let chosen: any[] = [];
-    for (const terms of tiers) {
-      const ms = markets
-        .filter((m) => isLiveForecast(m) && matchesAny(marketText(m), terms))
-        .sort((a, b) => vol(b) - vol(a));
-      if (ms.length) {
-        chosen = ms.slice(0, 2);
-        break;
-      }
+    const c = await chooseStockMarket(ticker);
+    if (!c) return [];
+    const m = c.market;
+    const token = clobTokenId(m);
+    if (!token) return [];
+    const endTs = Math.floor(Date.now() / 1000);
+    const startTs = endTs - (days + 1) * 86400;
+    const url = `https://clob.polymarket.com/prices-history?market=${token}&startTs=${startTs}&endTs=${endTs}&fidelity=1440`;
+    const res = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(6000) });
+    if (!res.ok) throw new Error(`clob ${res.status}`);
+    const data = (await res.json()) as { history?: { t: number; p: number }[] };
+    const byDay = new Map<string, number>();
+    for (const h of data.history ?? []) {
+      if (typeof h.t === "number" && typeof h.p === "number") byDay.set(new Date(h.t * 1000).toISOString().slice(0, 10), h.p);
     }
-    if (!chosen.length) return fallbackPoly(ticker);
-
-    return chosen.map((m) => ({
-      ticker,
-      ts: now,
-      marketId: String(m.id ?? m.conditionId ?? m.slug ?? ""),
-      question: m.question ?? m.title ?? "",
-      prob: leadProbability(m),
-      url: m.slug ? `https://polymarket.com/event/${m.slug}` : "https://polymarket.com",
-    }));
+    const question = m.question ?? m._evText ?? "";
+    return [...byDay.entries()].map(([date, prob]) => ({ date, prob, question })).sort((a, b) => (a.date < b.date ? -1 : 1));
   } catch (e) {
-    console.error("[polymarket] live call failed, using fallback:", e);
-    return fallbackPoly(ticker);
+    console.error("[polymarket:history]", e);
+    return [];
   }
 }
 
-// Pick the single best live market for a ticker (company -> tech -> macro).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function chosenMarket(ticker: string): Promise<any | null> {
-  const markets = await getMarkets();
-  const tiers = [COMPANY[ticker] ?? [ticker.toLowerCase()], TECH, MACRO];
-  for (const terms of tiers) {
-    const ms = markets.filter((m) => isLiveForecast(m) && matchesAny(marketText(m), terms)).sort((a, b) => vol(b) - vol(a));
-    if (ms.length) return ms[0];
+function vol(m: any): number {
+  return Number(m.volumeNum ?? m.volume ?? m.volume24hr ?? 0) || 0;
+}
+
+// Yes/first-outcome probability — the crowd's odds of the event happening.
+// (The old code took max(outcomePrices), which returns the NO price for a
+// threshold rung pinned at ["0","1"] and made every rung look ~100% certain.)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function yesProbability(m: any): number {
+  try {
+    const raw = m.outcomePrices;
+    const arr: string[] = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (Array.isArray(arr) && arr.length) {
+      const n = Number(arr[0]);
+      if (!Number.isNaN(n)) return n;
+    }
+  } catch {
+    /* ignore */
   }
-  return null;
+  if (typeof m.lastTradePrice === "number") return m.lastTradePrice;
+  return 0.5;
+}
+
+// Parse the dollar strike from a threshold question, e.g.
+// "Will NVIDIA (NVDA) hit (HIGH) $232 Week of May 18 2026?" -> 232.
+function parseStrike(text: string): number | null {
+  const m = /\$\s?([\d,]+(?:\.\d+)?)/.exec(text);
+  if (!m) return null;
+  const n = Number(m[1].replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+// Is this market still live (not resolved/closed and not past its end date)?
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function isOpen(m: any): boolean {
+  if (m.closed === true || m.active === false) return false;
+  const end = m.endDate ?? m.endDateIso ?? m.end_date_iso;
+  if (end) {
+    const t = Date.parse(end);
+    if (!Number.isNaN(t)) return t > Date.now();
+  }
+  return true;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -104,71 +212,20 @@ function clobTokenId(m: any): string | null {
   }
 }
 
-// Real 5-day daily odds history for the matched market (CLOB /prices-history).
-export async function polymarketHistory(ticker: string, days = 5): Promise<{ date: string; prob: number; question: string }[]> {
-  try {
-    const m = await chosenMarket(ticker);
-    if (!m) return [];
-    const token = clobTokenId(m);
-    if (!token) return [];
-    const endTs = Math.floor(Date.now() / 1000);
-    const startTs = endTs - (days + 1) * 86400;
-    const url = `https://clob.polymarket.com/prices-history?market=${token}&startTs=${startTs}&endTs=${endTs}&fidelity=1440`;
-    const res = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(6000) });
-    if (!res.ok) throw new Error(`clob ${res.status}`);
-    const data = (await res.json()) as { history?: { t: number; p: number }[] };
-    const byDay = new Map<string, number>();
-    for (const h of data.history ?? []) {
-      if (typeof h.t === "number" && typeof h.p === "number") byDay.set(new Date(h.t * 1000).toISOString().slice(0, 10), h.p);
-    }
-    const question = m.question ?? m.title ?? "";
-    return [...byDay.entries()].map(([date, prob]) => ({ date, prob, question })).sort((a, b) => (a.date < b.date ? -1 : 1));
-  } catch (e) {
-    console.error("[polymarket:history]", e);
-    return [];
-  }
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function marketText(m: any): string {
-  return `${m.question ?? ""} ${m.title ?? ""} ${m.slug ?? ""}`.replace(/-/g, " ");
-}
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function vol(m: any): number {
-  return Number(m.volumeNum ?? m.volume ?? m.volume24hr ?? 0) || 0;
-}
-function matchesAny(text: string, terms: string[]): boolean {
-  return terms.some((t) => {
-    const esc = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`\\b${esc}\\b`, "i").test(text);
-  });
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function leadProbability(m: any): number {
-  try {
-    const raw = m.outcomePrices;
-    const arr: string[] = typeof raw === "string" ? JSON.parse(raw) : raw;
-    if (Array.isArray(arr) && arr.length) {
-      const nums = arr.map((x) => Number(x)).filter((x) => !Number.isNaN(x));
-      if (nums.length) return Math.max(...nums);
-    }
-  } catch {
-    /* ignore */
-  }
-  if (typeof m.lastTradePrice === "number") return m.lastTradePrice;
-  return 0.5;
-}
-
+// Differentiated, clearly-labeled sample (per-ticker varied — never all the same).
 function fallbackPoly(ticker: string): PolyPoint[] {
-  const seed = (Date.now() / 60000) | 0;
-  const prob = 0.4 + ((seed + ticker.length) % 50) / 100;
+  let h = 2166136261;
+  for (let i = 0; i < ticker.length; i++) {
+    h ^= ticker.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  const prob = 0.35 + ((h >>> 0) % 50) / 100; // 0.35..0.84, distinct per ticker
   return [
     {
       ticker,
       ts: Date.now(),
       marketId: `sample-${ticker}`,
-      question: `[sample] Will ${ticker} make a major move this quarter?`,
+      question: `[sample] crowd odds for ${ticker}`,
       prob: Number(prob.toFixed(2)),
       url: "https://polymarket.com",
     },
